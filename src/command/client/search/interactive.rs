@@ -1,7 +1,8 @@
-use std::io::stdout;
+use std::{io::stdout, sync::Arc};
 
 use eyre::Result;
 use semver::Version;
+use skim::{prelude::ExactOrFuzzyEngineFactory, MatchEngineFactory, SkimItem};
 use termion::{
     event::Event as TermEvent, event::Key, event::MouseButton, event::MouseEvent,
     input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen,
@@ -17,11 +18,10 @@ use tui::{
 use unicode_width::UnicodeWidthStr;
 
 use atuin_client::{
-    database::current_context,
-    database::Context,
     database::Database,
+    database::{current_context, Context},
     history::History,
-    settings::{ExitMode, FilterMode, SearchMode, Settings},
+    settings::{ExitMode, FilterMode, Settings},
 };
 
 use super::{
@@ -44,22 +44,48 @@ struct State {
 }
 
 impl State {
-    async fn query_results(
-        &mut self,
-        search_mode: SearchMode,
-        db: &mut impl Database,
-    ) -> Result<Vec<History>> {
-        let i = self.input.as_str();
-        let results = if i.is_empty() {
-            db.list(self.filter_mode, &self.context, Some(200), true)
-                .await?
+    fn query_results(&mut self, db: &[Arc<SkimHistory>]) -> Vec<Arc<SkimHistory>> {
+        let mut set = Vec::with_capacity(200);
+        if self.input.as_str().is_empty() {
+            for item in db {
+                match self.filter_mode {
+                    FilterMode::Global => set.push(item.clone()),
+                    FilterMode::Host if item.0.hostname == self.context.hostname => {
+                        set.push(item.clone());
+                    }
+                    FilterMode::Session if item.0.session == self.context.session => {
+                        set.push(item.clone());
+                    }
+                    FilterMode::Directory if item.0.cwd == self.context.cwd => {
+                        set.push(item.clone());
+                    }
+                    _ => {}
+                }
+                if set.len() == 200 {
+                    break;
+                }
+            }
         } else {
-            db.search(Some(200), search_mode, self.filter_mode, &self.context, i)
-                .await?
-        };
-
-        self.results_state.select(0);
-        Ok(results)
+            let mut ranks = Vec::with_capacity(200);
+            let engine =
+                ExactOrFuzzyEngineFactory::builder().fuzzy_algorithm(skim::FuzzyAlgorithm::SkimV2);
+            let engine = engine.create_engine(self.input.as_str());
+            for item in db {
+                if let Some(res) = engine.match_item(item.clone()) {
+                    let (Ok(i) | Err(i)) = ranks.binary_search(&res.rank);
+                    if i >= 200 {
+                        continue;
+                    }
+                    if set.len() == 200 {
+                        set.pop();
+                        ranks.pop();
+                    }
+                    ranks.insert(i, res.rank);
+                    set.insert(i, item.clone());
+                }
+            }
+        }
+        set
     }
 
     fn handle_input(
@@ -140,7 +166,7 @@ impl State {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn draw<T: Backend>(&mut self, f: &mut Frame<'_, T>, results: &[History]) {
+    fn draw<T: Backend>(&mut self, f: &mut Frame<'_, T>, results: &[Arc<SkimHistory>]) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(0)
@@ -231,7 +257,7 @@ impl State {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn draw_compact<T: Backend>(&mut self, f: &mut Frame<'_, T>, results: &[History]) {
+    fn draw_compact<T: Backend>(&mut self, f: &mut Frame<'_, T>, results: &[Arc<SkimHistory>]) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(0)
@@ -303,6 +329,13 @@ impl State {
     }
 }
 
+pub struct SkimHistory(pub History);
+impl SkimItem for SkimHistory {
+    fn text(&self) -> std::borrow::Cow<str> {
+        std::borrow::Cow::Borrowed(self.0.command.as_str())
+    }
+}
+
 // this is a big blob of horrible! clean it up!
 // for now, it works. But it'd be great if it were more easily readable, and
 // modular. I'd like to add some more stats and stuff at some point
@@ -327,11 +360,22 @@ pub async fn history(
 
     let update_needed = settings.needs_update().await;
 
+    let context = current_context();
+
+    let all_entries = db
+        .list(FilterMode::Global, &context, None, true)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(SkimHistory)
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+
     let mut app = State {
         history_count: db.history_count().await?,
         input,
         results_state: ListState::default(),
-        context: current_context(),
+        context,
         filter_mode: if settings.shell_up_key_binding {
             settings.filter_mode_shell_up_key_binding
         } else {
@@ -340,7 +384,7 @@ pub async fn history(
         update_needed,
     };
 
-    let mut results = app.query_results(settings.search_mode, db).await?;
+    let mut results = app.query_results(&all_entries);
 
     let index = 'render: loop {
         let initial_input = app.input.as_str().to_owned();
@@ -361,7 +405,7 @@ pub async fn history(
         }
 
         if initial_input != app.input.as_str() || initial_filter_mode != app.filter_mode {
-            results = app.query_results(settings.search_mode, db).await?;
+            results = app.query_results(&all_entries);
         }
 
         let compact = match settings.style {
@@ -380,7 +424,7 @@ pub async fn history(
 
     if index < results.len() {
         // index is in bounds so we return that entry
-        Ok(results.swap_remove(index).command)
+        Ok(results.swap_remove(index).0.command.clone())
     } else if index == RETURN_ORIGINAL {
         Ok(String::new())
     } else {
